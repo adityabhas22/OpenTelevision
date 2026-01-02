@@ -2,7 +2,7 @@ import time
 from vuer import Vuer
 from vuer.events import ClientEvent
 from vuer.schemas import ImageBackground, group, Hands, WebRTCStereoVideoPlane, DefaultScene
-from multiprocessing import Array, Process, shared_memory, Queue, Manager, Event, Semaphore
+from multiprocessing import Array, Process, shared_memory, Queue, Manager, Event, Semaphore, Value
 import numpy as np
 import asyncio
 from webrtc.zed_server import *
@@ -16,7 +16,8 @@ class OpenTeleVision:
         if ngrok:
             self.app = Vuer(host='0.0.0.0', queries=dict(grid=False), queue_len=3)
         else:
-            self.app = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+            # Run without SSL - use Tailscale Funnel for trusted HTTPS
+            self.app = Vuer(host='0.0.0.0', queries=dict(grid=False), queue_len=3)
 
         self.app.add_handler("HAND_MOVE")(self.on_hand_move)
         self.app.add_handler("CAMERA_MOVE")(self.on_cam_move)
@@ -95,20 +96,42 @@ class OpenTeleVision:
         # print("camera moved", event.value["matrix"].shape, event.value["matrix"])
 
     async def on_hand_move(self, event, session, fps=60):
+        """Handle hand tracking events from Vision Pro browser."""
         try:
-            # with self.left_hand_shared.get_lock():  # Use the lock to ensure thread-safe updates
-            #     self.left_hand_shared[:] = event.value["leftHand"]
-            # with self.right_hand_shared.get_lock():
-            #     self.right_hand_shared[:] = event.value["rightHand"]
-            # with self.left_landmarks_shared.get_lock():
-            #     self.left_landmarks_shared[:] = np.array(event.value["leftLandmarks"]).flatten()
-            # with self.right_landmarks_shared.get_lock():
-            #     self.right_landmarks_shared[:] = np.array(event.value["rightLandmarks"]).flatten()
-            self.left_hand_shared[:] = event.value["leftHand"]
-            self.right_hand_shared[:] = event.value["rightHand"]
-            self.left_landmarks_shared[:] = np.array(event.value["leftLandmarks"]).flatten()
-            self.right_landmarks_shared[:] = np.array(event.value["rightLandmarks"]).flatten()
-        except: 
+            # Try leftHand/rightHand first (older Vuer format)
+            if "leftHand" in event.value:
+                self.left_hand_shared[:] = event.value["leftHand"]
+                self.right_hand_shared[:] = event.value["rightHand"]
+            # Try left/right (newer format - Float32Arrays with joint matrices)
+            elif "left" in event.value:
+                left_data = np.array(event.value["left"])
+                right_data = np.array(event.value["right"])
+                # First 16 values are wrist transformation matrix
+                if len(left_data) >= 16:
+                    self.left_hand_shared[:] = left_data[:16]
+                if len(right_data) >= 16:
+                    self.right_hand_shared[:] = right_data[:16]
+            
+            # Try leftLandmarks/rightLandmarks
+            if "leftLandmarks" in event.value:
+                self.left_landmarks_shared[:] = np.array(event.value["leftLandmarks"]).flatten()
+                self.right_landmarks_shared[:] = np.array(event.value["rightLandmarks"]).flatten()
+            # Extract landmarks from joint matrices if landmarks not separate
+            elif "left" in event.value:
+                left_data = np.array(event.value["left"])
+                right_data = np.array(event.value["right"])
+                # Each joint has 16 values (4x4 matrix), position is in last column
+                if len(left_data) >= 25 * 16:
+                    left_positions = []
+                    right_positions = []
+                    for i in range(25):
+                        # Position is at indices 12, 13, 14 of each 16-value matrix
+                        offset = i * 16
+                        left_positions.extend([left_data[offset + 12], left_data[offset + 13], left_data[offset + 14]])
+                        right_positions.extend([right_data[offset + 12], right_data[offset + 13], right_data[offset + 14]])
+                    self.left_landmarks_shared[:] = left_positions
+                    self.right_landmarks_shared[:] = right_positions
+        except:
             pass
     
     async def main_webrtc(self, session, fps=60):
@@ -126,74 +149,12 @@ class OpenTeleVision:
             await asyncio.sleep(1)
     
     async def main_image(self, session, fps=60):
-        session.upsert @ Hands(fps=fps, stream=True, key="hands", showLeft=False, showRight=False)
-        end_time = time.time()
+        """Main session handler for image streaming mode."""
+        # Show only right hand in VR (left hand hidden)
+        session.upsert @ Hands(fps=fps, stream=True, key="hands", showLeft=False, showRight=True)
+        # Keep connection alive
         while True:
-            start = time.time()
-            # print(end_time - start)
-            # aspect = self.aspect_shared.value
-            display_image = self.img_array
-
-            # session.upsert(
-            # ImageBackground(
-            #     # Can scale the images down.
-            #     display_image[:self.img_height],
-            #     # 'jpg' encoding is significantly faster than 'png'.
-            #     format="jpeg",
-            #     quality=80,
-            #     key="left-image",
-            #     interpolate=True,
-            #     # fixed=True,
-            #     aspect=1.778,
-            #     distanceToCamera=2,
-            #     position=[0, -0.5, -2],
-            #     rotation=[0, 0, 0],
-            # ),
-            # to="bgChildren",
-            # )
-
-            session.upsert(
-            [ImageBackground(
-                # Can scale the images down.
-                display_image[::2, :self.img_width],
-                # display_image[:self.img_height:2, ::2],
-                # 'jpg' encoding is significantly faster than 'png'.
-                format="jpeg",
-                quality=80,
-                key="left-image",
-                interpolate=True,
-                # fixed=True,
-                aspect=1.66667,
-                # distanceToCamera=0.5,
-                height = 8,
-                position=[0, -1, 3],
-                # rotation=[0, 0, 0],
-                layers=1, 
-                alphaSrc="./vinette.jpg"
-            ),
-            ImageBackground(
-                # Can scale the images down.
-                display_image[::2, self.img_width:],
-                # display_image[self.img_height::2, ::2],
-                # 'jpg' encoding is significantly faster than 'png'.
-                format="jpeg",
-                quality=80,
-                key="right-image",
-                interpolate=True,
-                # fixed=True,
-                aspect=1.66667,
-                # distanceToCamera=0.5,
-                height = 8,
-                position=[0, -1, 3],
-                # rotation=[0, 0, 0],
-                layers=2, 
-                alphaSrc="./vinette.jpg"
-            )],
-            to="bgChildren",
-            )
-            # rest_time = 1/fps - time.time() + start
-            end_time = time.time()
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.1)
 
     @property
     def left_hand(self):
