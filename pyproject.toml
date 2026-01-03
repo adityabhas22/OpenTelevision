@@ -1,0 +1,196 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opentelevision"
+version = "0.2.0"
+description = "Open-TeleVision: Teleoperation with Immersive Active Visual Feedback"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "OpenTelevision Team"}
+]
+requires-python = ">=3.11,<3.14"
+keywords = ["teleoperation", "robotics", "vr", "inverse-kinematics", "jax"]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Human Machine Interfaces",
+]
+
+# =============================================================================
+# CORE DEPENDENCIES
+# =============================================================================
+# These are required for the IK solver and basic teleoperation functionality.
+# Dependency versions are carefully chosen for compatibility:
+#   - numpy >= 2.0: Required by dex-retargeting >= 0.5.0
+#   - opencv >= 4.11: Built with numpy 2.x support
+#   - JAX: Installed separately with CUDA extras (see [project.optional-dependencies])
+# =============================================================================
+dependencies = [
+    # ==== Core Scientific ====
+    "numpy>=2.0.0",
+    "scipy>=1.11.0",
+    
+    # ==== Robotics / IK ====
+    "urdf-parser-py>=0.0.4",
+    "pytransform3d>=3.5.0",
+    "jaxopt>=0.8.0",  # Gauss-Newton, Levenberg-Marquardt solvers
+    
+    # ==== Hand Retargeting ====
+    # NOTE: dex-retargeting 0.5+ officially supports numpy >= 2.0
+    "dex-retargeting>=0.5.0",
+    
+    # ==== Vision ====
+    # Using latest opencv for numpy 2.x compatibility
+    "opencv-contrib-python>=4.11.0",
+    "opencv-python>=4.11.0",
+    
+    # ==== WebXR / Communication ====
+    "aiohttp>=3.9.0",
+    "aiohttp-cors>=0.7.0",
+    "aiortc>=1.8.0",
+    "av>=11.0.0",
+    "vuer>=0.0.32rc7",
+    
+    # ==== ML / Deep Learning ====
+    "einops>=0.8.0",
+    
+    # ==== Data & Visualization ====
+    "h5py>=3.11.0",
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+    "pandas>=2.1.0",
+    
+    # ==== Utilities ====
+    "tqdm>=4.66.0",
+    "PyYAML>=6.0",
+    "packaging>=24.0",
+    "params-proto>=2.12.0",
+    "ipython>=8.12.0",
+    "setuptools>=69.0.0",
+]
+
+# =============================================================================
+# OPTIONAL DEPENDENCY GROUPS
+# =============================================================================
+[project.optional-dependencies]
+
+# JAX with CUDA 13 support (for NVIDIA GPUs)
+# Install with: uv pip install -e ".[cuda]"
+cuda = [
+    "jax[cuda13]>=0.5.0",
+]
+
+# JAX CPU-only (for development/testing without GPU)
+# Install with: uv pip install -e ".[cpu]"
+cpu = [
+    "jax>=0.5.0",
+    "jaxlib>=0.5.0",
+]
+
+# PyTorch dependencies (for RUKA hand control LSTM models)
+# NOTE: PyTorch 2.6+ required for Python 3.13 support
+# Install with: uv pip install -e ".[torch]"
+torch = [
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+]
+
+# Dynamixel servo support (for RUKA hands)
+# Install with: uv pip install -e ".[dynamixel]"
+dynamixel = [
+    "dynamixel-sdk>=3.7.31",
+]
+
+# Development tools
+# Install with: uv pip install -e ".[dev]"
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+# Experiment tracking
+# Install with: uv pip install -e ".[wandb]"
+wandb = [
+    "wandb>=0.17.0",
+    "scikit-learn>=1.3.0",
+]
+
+# Full installation with CUDA (most common use case)
+# Install with: uv pip install -e ".[full]"
+full = [
+    "opentelevision[cuda,torch,dynamixel,wandb]",
+]
+
+# Full installation CPU-only
+# Install with: uv pip install -e ".[full-cpu]"
+full-cpu = [
+    "opentelevision[cpu,torch,dynamixel,wandb]",
+]
+
+[project.urls]
+Homepage = "https://github.com/adityabhas22/OpenTelevision"
+Repository = "https://github.com/adityabhas22/OpenTelevision"
+
+[project.scripts]
+# Add CLI entry points here if needed
+# teleop = "teleop.cli:main"
+
+# =============================================================================
+# UV CONFIGURATION
+# =============================================================================
+[tool.uv]
+# Index configuration for JAX CUDA wheels
+# This helps UV find the correct CUDA-enabled wheels
+index-url = "https://pypi.org/simple"
+extra-index-url = [
+    "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
+]
+
+# =============================================================================
+# SETUPTOOLS CONFIGURATION
+# =============================================================================
+[tool.setuptools]
+packages = ["teleop", "teleop.ik", "teleop.dynamixel", "teleop.webrtc"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yml", "*.yaml", "*.json"]
+
+# =============================================================================
+# RUFF LINTER CONFIGURATION
+# =============================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]  # Line length handled separately
+
+# =============================================================================
+# MYPY TYPE CHECKING
+# =============================================================================
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+# =============================================================================
+# PYTEST CONFIGURATION
+# =============================================================================
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

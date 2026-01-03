@@ -1,304 +1,468 @@
 #!/usr/bin/env python3
 """
-Comprehensive IK Solver Stress Test
+Comprehensive Stress Tests for IK Solvers.
 
-This script tests the IK solver across the robot's entire reachable workspace
-to evaluate accuracy and identify failure modes.
+Simulates realistic VR teleoperation scenarios:
+1. Smooth continuous tracking (normal operation)
+2. Fast jerky movements (user quickly moving)
+3. Edge of workspace (reaching limits)
+4. Random noise (tracking jitter from VR)
+5. Long duration (thermal/memory stability)
+6. Comparison of all solvers
 
-Tests include:
-1. Grid sampling of the workspace
-2. Random pose sampling
-3. Edge cases (singularities, joint limits)
-4. Parameter tuning comparison
+Usage:
+    # Run all tests
+    python scripts/stress_test_ik.py
+    
+    # Run specific test
+    python scripts/stress_test_ik.py --test smooth
+    
+    # Quick mode (fewer iterations)
+    python scripts/stress_test_ik.py --quick
 """
 
-import sys
+import argparse
 import time
-from pathlib import Path
-from typing import Tuple, List
 import numpy as np
-
-# Add the repo root to path for imports
-REPO_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
+import jax
 import jax.numpy as jnp
-from jax import random
+from typing import List, Tuple, Callable
+import sys
+import os
 
-from teleop.ik import RobotModel, IKSolver, SE3Pose
+# Add parent to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-def print_header(title: str) -> None:
-    """Print a formatted header."""
-    print(f"\n{'=' * 70}")
-    print(f"  {title}")
-    print('=' * 70)
-
-
-def print_stats(errors: List[float], times: List[float], label: str) -> None:
-    """Print statistics for a set of IK solves."""
-    errors = np.array(errors)
-    times = np.array(times)
-    
-    success_rate = np.sum(errors < 0.01) / len(errors) * 100  # < 1cm = success
-    
-    print(f"\n{label}:")
-    print(f"  Position Error (cm):")
-    print(f"    Mean: {np.mean(errors)*100:.2f}, Median: {np.median(errors)*100:.2f}")
-    print(f"    Min: {np.min(errors)*100:.2f}, Max: {np.max(errors)*100:.2f}")
-    print(f"    Std: {np.std(errors)*100:.2f}")
-    print(f"  Success Rate (<1cm): {success_rate:.1f}%")
-    print(f"  Solve Time (ms):")
-    print(f"    Mean: {np.mean(times):.2f}, Median: {np.median(times):.2f}")
+from teleop.ik import (
+    RobotModel, 
+    OptimizedIKSolver, 
+    SmoothIKSolver,
+    DualArmIKSolver,
+    SE3Pose
+)
+from teleop.utils.filters import WeightedMovingFilter
 
 
-def test_parameter_comparison(robot: RobotModel) -> dict:
-    """
-    Test 1: Compare different solver parameter configurations.
-    """
-    print_header("Test 1: Parameter Tuning Comparison")
+class TestResult:
+    """Container for test results."""
+    def __init__(self, name: str):
+        self.name = name
+        self.solve_times: List[float] = []
+        self.position_errors: List[float] = []
+        self.orientation_errors: List[float] = []
+        self.converged: List[bool] = []
+        self.joint_changes: List[float] = []
     
-    # Generate a set of test targets using FK from random joint configs
-    key = random.PRNGKey(42)
-    num_tests = 20
+    def add(self, solve_time_ms: float, pos_err: float, ori_err: float, 
+            converged: bool, joint_change: float = 0):
+        self.solve_times.append(solve_time_ms)
+        self.position_errors.append(pos_err)
+        self.orientation_errors.append(ori_err)
+        self.converged.append(converged)
+        self.joint_changes.append(joint_change)
     
-    test_targets = []
-    for i in range(num_tests):
-        key, subkey = random.split(key)
-        lower, upper = robot.joint_limits
-        random_angles = random.uniform(subkey, (robot.num_joints,), minval=lower, maxval=upper)
-        pose = robot.forward_kinematics(random_angles)
-        test_targets.append((pose, random_angles))
-    
-    # Different parameter configurations to test
-    configs = {
-        "Conservative (current)": {
-            "position_weight": 1.0,
-            "orientation_weight": 0.3,
-            "joint_limit_weight": 0.1,
-            "regularization_weight": 0.01,
-            "learning_rate": 0.15,
-            "max_iterations": 200,
-        },
-        "Position-focused": {
-            "position_weight": 2.0,
-            "orientation_weight": 0.1,
-            "joint_limit_weight": 0.05,
-            "regularization_weight": 0.0,
-            "learning_rate": 0.2,
-            "max_iterations": 150,
-        },
-        "Aggressive LR": {
-            "position_weight": 1.0,
-            "orientation_weight": 0.2,
-            "joint_limit_weight": 0.1,
-            "regularization_weight": 0.01,
-            "learning_rate": 0.4,
-            "max_iterations": 100,
-        },
-        "High Iterations": {
-            "position_weight": 1.0,
-            "orientation_weight": 0.3,
-            "joint_limit_weight": 0.1,
-            "regularization_weight": 0.01,
-            "learning_rate": 0.1,
-            "max_iterations": 500,
-        },
-    }
-    
-    best_config = None
-    best_success = 0
-    
-    for config_name, params in configs.items():
-        print(f"\nTesting: {config_name}")
-        solver = IKSolver(robot, **params)
+    def summary(self) -> dict:
+        times = np.array(self.solve_times)
+        pos_errs = np.array(self.position_errors) * 1000  # to mm
+        joint_changes = np.array(self.joint_changes)
         
-        errors = []
-        times = []
-        
-        for target_pose, _ in test_targets:
-            start = time.time()
-            result = solver.solve(target_pose, initial_guess=jnp.zeros(robot.num_joints))
-            elapsed = (time.time() - start) * 1000
-            
-            errors.append(result.position_error)
-            times.append(elapsed)
-        
-        print_stats(errors, times, config_name)
-        
-        success_rate = np.sum(np.array(errors) < 0.01) / len(errors) * 100
-        if success_rate > best_success:
-            best_success = success_rate
-            best_config = config_name
+        return {
+            "name": self.name,
+            "solve_time_mean_ms": float(np.mean(times)),
+            "solve_time_p95_ms": float(np.percentile(times, 95)),
+            "solve_time_max_ms": float(np.max(times)),
+            "frequency_hz": 1000 / float(np.mean(times)),
+            "position_error_mean_mm": float(np.mean(pos_errs)),
+            "position_error_max_mm": float(np.max(pos_errs)),
+            "convergence_rate": float(np.mean(self.converged)),
+            "joint_change_mean_rad": float(np.mean(joint_changes)),
+            "joint_change_max_rad": float(np.max(joint_changes)),
+        }
     
-    print(f"\n★ Best Config: {best_config} ({best_success:.1f}% success)")
-    return configs[best_config]
+    def print_summary(self):
+        s = self.summary()
+        print(f"\n{'='*60}")
+        print(f"Test: {s['name']}")
+        print(f"{'='*60}")
+        print(f"  Solve Time:     {s['solve_time_mean_ms']:.2f} ms mean | "
+              f"{s['solve_time_p95_ms']:.2f} ms P95 | {s['solve_time_max_ms']:.2f} ms max")
+        print(f"  Frequency:      {s['frequency_hz']:.1f} Hz")
+        print(f"  Position Error: {s['position_error_mean_mm']:.3f} mm mean | "
+              f"{s['position_error_max_mm']:.3f} mm max")
+        print(f"  Convergence:    {s['convergence_rate']*100:.1f}%")
+        print(f"  Joint Change:   {s['joint_change_mean_rad']:.4f} rad mean | "
+              f"{s['joint_change_max_rad']:.4f} rad max")
+        
+        # VR compatibility
+        if s['solve_time_p95_ms'] < 6.9:
+            print(f"  VR Compat:      ✅ Valve Index (144 Hz)")
+        elif s['solve_time_p95_ms'] < 11.1:
+            print(f"  VR Compat:      ✅ Quest 3 / AVP (90 Hz)")
+        elif s['solve_time_p95_ms'] < 16.7:
+            print(f"  VR Compat:      ✅ Quest 2 (60 Hz)")
+        else:
+            print(f"  VR Compat:      ⚠️ Data collection only")
 
 
-def test_workspace_grid(robot: RobotModel, solver: IKSolver) -> None:
-    """
-    Test 2: Grid sampling across the workspace.
-    """
-    print_header("Test 2: Workspace Grid Sampling")
-    
-    # Sample the joint space in a grid
+def generate_smooth_trajectory(
+    robot: RobotModel,
+    num_frames: int,
+    speed: float = 0.02,
+    seed: int = 42
+) -> List[SE3Pose]:
+    """Generate smooth continuous trajectory (normal VR tracking)."""
+    rng = jax.random.PRNGKey(seed)
     lower, upper = robot.joint_limits
-    num_samples_per_joint = 3  # 3^7 = 2187 samples (for 7-DOF)
+    current = (lower + upper) / 2
     
-    # For speed, only sample a subset of joints fully
-    grid_samples = []
-    for i in range(num_samples_per_joint ** min(robot.num_joints, 4)):
-        # Create a sample by varying first 4 joints, keeping rest at 0
-        sample = jnp.zeros(robot.num_joints)
-        idx = i
-        for j in range(min(robot.num_joints, 4)):
-            val = idx % num_samples_per_joint
-            idx //= num_samples_per_joint
-            # Map to joint range
-            t = val / (num_samples_per_joint - 1)
-            sample = sample.at[j].set(lower[j] + t * (upper[j] - lower[j]))
-        grid_samples.append(sample)
+    targets = []
+    for i in range(num_frames):
+        rng, subkey = jax.random.split(rng)
+        delta = jax.random.normal(subkey, shape=(robot.num_joints,)) * speed
+        current = jnp.clip(current + delta, lower, upper)
+        targets.append(robot.forward_kinematics(current))
     
-    print(f"Testing {len(grid_samples)} grid positions...")
-    
-    errors = []
-    times = []
-    failures = []
-    
-    for i, joint_config in enumerate(grid_samples):
-        # Get target pose from FK
-        target_pose = robot.forward_kinematics(joint_config)
-        
-        # Solve IK from zeros (cold start)
-        start = time.time()
-        result = solver.solve(target_pose, initial_guess=jnp.zeros(robot.num_joints))
-        elapsed = (time.time() - start) * 1000
-        
-        errors.append(result.position_error)
-        times.append(elapsed)
-        
-        if result.position_error > 0.05:  # > 5cm is a significant failure
-            failures.append({
-                "target_joints": joint_config,
-                "solved_joints": result.joint_angles,
-                "error": result.position_error,
-            })
-        
-        if (i + 1) % 20 == 0:
-            print(f"  Progress: {i+1}/{len(grid_samples)}")
-    
-    print_stats(errors, times, "Grid Sampling Results")
-    
-    if failures:
-        print(f"\n⚠️  Significant failures (>5cm): {len(failures)}")
-        print("  Worst failures:")
-        failures.sort(key=lambda x: x["error"], reverse=True)
-        for fail in failures[:3]:
-            print(f"    Error: {fail['error']*100:.1f}cm at joints: {fail['target_joints'][:3]}...")
+    return targets
 
 
-def test_edge_cases(robot: RobotModel, solver: IKSolver) -> None:
-    """
-    Test 3: Edge cases and potential singularities.
-    """
-    print_header("Test 3: Edge Cases & Singularities")
+def generate_jerky_trajectory(
+    robot: RobotModel,
+    num_frames: int,
+    jerk_probability: float = 0.1,
+    seed: int = 42
+) -> List[SE3Pose]:
+    """Generate trajectory with occasional fast movements."""
+    rng = jax.random.PRNGKey(seed)
+    lower, upper = robot.joint_limits
+    current = (lower + upper) / 2
     
+    targets = []
+    for i in range(num_frames):
+        rng, k1, k2 = jax.random.split(rng, 3)
+        
+        # Random jerk check
+        if float(jax.random.uniform(k1)) < jerk_probability:
+            # Large sudden movement
+            delta = jax.random.normal(k2, shape=(robot.num_joints,)) * 0.2
+        else:
+            # Normal smooth movement
+            delta = jax.random.normal(k2, shape=(robot.num_joints,)) * 0.02
+        
+        current = jnp.clip(current + delta, lower, upper)
+        targets.append(robot.forward_kinematics(current))
+    
+    return targets
+
+
+def generate_workspace_edge_trajectory(
+    robot: RobotModel,
+    num_frames: int,
+    seed: int = 42
+) -> List[SE3Pose]:
+    """Generate trajectory that explores workspace edges."""
+    rng = jax.random.PRNGKey(seed)
     lower, upper = robot.joint_limits
     
-    edge_cases = {
-        "All joints at lower limits": lower,
-        "All joints at upper limits": upper,
-        "All joints at zero": jnp.zeros(robot.num_joints),
-        "All joints at midpoint": (lower + upper) / 2,
-        "Alternating limits": jnp.where(jnp.arange(robot.num_joints) % 2 == 0, lower, upper),
-    }
+    targets = []
+    for i in range(num_frames):
+        rng, subkey = jax.random.split(rng)
+        
+        # Bias towards extremes (U-shaped distribution)
+        raw = jax.random.uniform(subkey, shape=(robot.num_joints,))
+        biased = jnp.where(raw < 0.5, raw * 0.3, 1 - (1 - raw) * 0.3)
+        
+        angles = lower + biased * (upper - lower)
+        targets.append(robot.forward_kinematics(angles))
     
-    for case_name, joint_config in edge_cases.items():
-        target_pose = robot.forward_kinematics(joint_config)
-        
-        start = time.time()
-        result = solver.solve(target_pose, initial_guess=jnp.zeros(robot.num_joints))
-        elapsed = (time.time() - start) * 1000
-        
-        status = "✅" if result.position_error < 0.01 else "⚠️" if result.position_error < 0.05 else "❌"
-        print(f"{status} {case_name}: err={result.position_error*100:.2f}cm, time={elapsed:.1f}ms")
+    return targets
 
 
-def test_continuous_trajectory(robot: RobotModel, solver: IKSolver) -> None:
-    """
-    Test 4: Simulate a continuous trajectory (teleop-like).
-    """
-    print_header("Test 4: Continuous Trajectory (Teleop Simulation)")
+def generate_noisy_trajectory(
+    robot: RobotModel,
+    num_frames: int,
+    noise_level: float = 0.05,
+    seed: int = 42
+) -> List[SE3Pose]:
+    """Smooth trajectory with added VR tracking noise."""
+    rng = jax.random.PRNGKey(seed)
+    lower, upper = robot.joint_limits
+    current = (lower + upper) / 2
     
-    # Create a circular trajectory in Cartesian space
-    num_waypoints = 50
-    center = jnp.array([0.15, -0.1, 0.0])  # Approximate center of workspace
-    radius = 0.05  # 5cm radius circle
-    
-    print(f"Simulating {num_waypoints}-point circular trajectory...")
-    
-    errors = []
-    times = []
-    current_angles = jnp.zeros(robot.num_joints)
-    
-    for i in range(num_waypoints):
-        angle = 2 * jnp.pi * i / num_waypoints
-        target_pos = center + jnp.array([radius * jnp.cos(angle), 0, radius * jnp.sin(angle)])
-        target_quat = jnp.array([1.0, 0.0, 0.0, 0.0])  # Fixed orientation
-        target = SE3Pose(position=target_pos, quaternion=target_quat)
+    targets = []
+    for i in range(num_frames):
+        rng, k1, k2 = jax.random.split(rng, 3)
         
-        start = time.time()
-        result = solver.solve_with_warmstart(target, current_angles)
-        elapsed = (time.time() - start) * 1000
+        # Smooth underlying motion
+        delta = jax.random.normal(k1, shape=(robot.num_joints,)) * 0.02
+        current = jnp.clip(current + delta, lower, upper)
         
-        current_angles = result.joint_angles
-        errors.append(result.position_error)
-        times.append(elapsed)
+        # Add noise
+        noise = jax.random.normal(k2, shape=(robot.num_joints,)) * noise_level
+        noisy = jnp.clip(current + noise, lower, upper)
+        
+        targets.append(robot.forward_kinematics(noisy))
     
-    print_stats(errors, times, "Trajectory Tracking Results")
+    return targets
+
+
+def run_solver_test(
+    solver,
+    targets: List[SE3Pose],
+    test_name: str,
+    warmup: int = 5
+) -> TestResult:
+    """Run a solver through a trajectory and collect metrics."""
+    result = TestResult(test_name)
     
-    # Calculate "smoothness" (jerk in joint space)
-    angles_history = [jnp.zeros(robot.num_joints)]  # placeholder
-    print(f"  Average solve frequency: {1000/np.mean(times):.1f} Hz")
+    # Reset solver if possible
+    if hasattr(solver, 'reset'):
+        solver.reset()
+    
+    prev_angles = None
+    
+    for i, target in enumerate(targets):
+        start = time.perf_counter()
+        
+        if hasattr(solver, 'solve'):
+            ik_result = solver.solve(target)
+            angles = ik_result.joint_angles
+            pos_err = ik_result.position_error
+            ori_err = getattr(ik_result, 'orientation_error', 0)
+            converged = ik_result.converged
+        else:
+            # For solvers with solve_warmstart
+            if prev_angles is None:
+                ik_result = solver.solve(target)
+            else:
+                ik_result = solver.solve_warmstart(target, prev_angles)
+            angles = ik_result.joint_angles
+            pos_err = ik_result.position_error
+            ori_err = ik_result.orientation_error
+            converged = ik_result.converged
+        
+        solve_time = (time.perf_counter() - start) * 1000
+        
+        # Calculate joint change
+        if prev_angles is not None:
+            joint_change = float(jnp.linalg.norm(angles - prev_angles))
+        else:
+            joint_change = 0
+        
+        prev_angles = angles
+        
+        # Skip warmup frames
+        if i >= warmup:
+            result.add(solve_time, pos_err, ori_err, converged, joint_change)
+    
+    return result
+
+
+def test_smooth_tracking(robot: RobotModel, solver, num_frames: int = 500) -> TestResult:
+    """Test normal smooth VR tracking."""
+    print("\n[TEST] Smooth Continuous Tracking...")
+    targets = generate_smooth_trajectory(robot, num_frames)
+    return run_solver_test(solver, targets, "Smooth Tracking")
+
+
+def test_jerky_movements(robot: RobotModel, solver, num_frames: int = 500) -> TestResult:
+    """Test handling of sudden fast movements."""
+    print("\n[TEST] Jerky Movements (10% sudden jumps)...")
+    targets = generate_jerky_trajectory(robot, num_frames, jerk_probability=0.1)
+    return run_solver_test(solver, targets, "Jerky Movements")
+
+
+def test_workspace_edges(robot: RobotModel, solver, num_frames: int = 500) -> TestResult:
+    """Test reaching to workspace limits."""
+    print("\n[TEST] Workspace Edge Exploration...")
+    targets = generate_workspace_edge_trajectory(robot, num_frames)
+    return run_solver_test(solver, targets, "Workspace Edges")
+
+
+def test_noisy_tracking(robot: RobotModel, solver, num_frames: int = 500) -> TestResult:
+    """Test with simulated VR tracking noise."""
+    print("\n[TEST] Noisy VR Tracking...")
+    targets = generate_noisy_trajectory(robot, num_frames, noise_level=0.05)
+    return run_solver_test(solver, targets, "Noisy Tracking")
+
+
+def test_long_duration(robot: RobotModel, solver, duration_seconds: float = 60) -> TestResult:
+    """Test stability over long duration."""
+    # Estimate frames needed for target duration
+    # First, measure baseline solve time
+    test_targets = generate_smooth_trajectory(robot, 10)
+    start = time.perf_counter()
+    for t in test_targets:
+        if hasattr(solver, 'solve'):
+            solver.solve(t)
+        else:
+            solver.solve(t)
+    baseline_time = (time.perf_counter() - start) / 10
+    
+    num_frames = int(duration_seconds / baseline_time)
+    print(f"\n[TEST] Long Duration ({duration_seconds}s, ~{num_frames} frames)...")
+    
+    targets = generate_smooth_trajectory(robot, num_frames)
+    return run_solver_test(solver, targets, f"Long Duration ({duration_seconds}s)")
+
+
+def compare_solvers(robot: RobotModel, num_frames: int = 200):
+    """Compare all available solvers."""
+    print("\n" + "="*70)
+    print("SOLVER COMPARISON")
+    print("="*70)
+    
+    # Generate shared trajectory
+    targets = generate_smooth_trajectory(robot, num_frames)
+    
+    solvers = [
+        ("OptimizedIKSolver (LM)", OptimizedIKSolver(robot, solver_type='levenberg_marquardt')),
+        ("OptimizedIKSolver (GN)", OptimizedIKSolver(robot, solver_type='gauss_newton')),
+        ("SmoothIKSolver (no filter)", SmoothIKSolver(robot, enable_filter=False)),
+        ("SmoothIKSolver (filtered)", SmoothIKSolver(robot, enable_filter=True)),
+    ]
+    
+    results = []
+    for name, solver in solvers:
+        print(f"\nTesting: {name}")
+        result = run_solver_test(solver, targets, name)
+        result.print_summary()
+        results.append(result)
+    
+    # Summary table
+    print("\n" + "="*70)
+    print("SUMMARY TABLE")
+    print("="*70)
+    print(f"{'Solver':<35} {'Mean (ms)':<12} {'P95 (ms)':<12} {'Hz':<10} {'Error (mm)':<12}")
+    print("-"*70)
+    for r in results:
+        s = r.summary()
+        print(f"{s['name']:<35} {s['solve_time_mean_ms']:<12.2f} "
+              f"{s['solve_time_p95_ms']:<12.2f} {s['frequency_hz']:<10.1f} "
+              f"{s['position_error_mean_mm']:<12.3f}")
+
+
+def test_dual_arm(num_frames: int = 200):
+    """Test dual-arm solver with both arms."""
+    print("\n" + "="*70)
+    print("DUAL-ARM SOLVER TEST")
+    print("="*70)
+    
+    left_robot = RobotModel(
+        'assets/h1_inspire/urdf/h1_inspire.urdf',
+        base_link='torso_link',
+        end_effector_link='left_wrist_yaw_link'
+    )
+    right_robot = RobotModel(
+        'assets/h1_inspire/urdf/h1_inspire.urdf',
+        base_link='torso_link',
+        end_effector_link='right_wrist_yaw_link'
+    )
+    
+    solver = DualArmIKSolver(left_robot, right_robot)
+    
+    # Generate targets for both arms
+    left_targets = generate_smooth_trajectory(left_robot, num_frames)
+    right_targets = generate_smooth_trajectory(right_robot, num_frames, seed=123)
+    
+    result = TestResult("Dual Arm (both arms)")
+    
+    print(f"\nTesting dual-arm with {num_frames} frames...")
+    solver.reset()
+    
+    for i in range(num_frames):
+        start = time.perf_counter()
+        ik_result = solver.solve(left_targets[i], right_targets[i])
+        solve_time = (time.perf_counter() - start) * 1000
+        
+        if i >= 5:  # Skip warmup
+            result.add(
+                solve_time,
+                (ik_result.left_position_error + ik_result.right_position_error) / 2,
+                0,
+                ik_result.left_converged and ik_result.right_converged,
+                0
+            )
+    
+    result.print_summary()
 
 
 def main():
-    """Run all optimization tests."""
-    print("\n" + "=" * 70)
-    print("  IK Solver Comprehensive Stress Test")
-    print("=" * 70)
+    parser = argparse.ArgumentParser(description="Stress test IK solvers")
+    parser.add_argument('--test', choices=['smooth', 'jerky', 'edge', 'noisy', 'long', 'compare', 'dual', 'all'],
+                        default='all', help='Which test to run')
+    parser.add_argument('--quick', action='store_true', help='Quick mode (fewer iterations)')
+    parser.add_argument('--solver', choices=['optimized', 'smooth', 'smooth_filtered'],
+                        default='smooth_filtered', help='Which solver to test')
+    args = parser.parse_args()
+    
+    # Set frame counts
+    if args.quick:
+        num_frames = 100
+        duration = 10
+    else:
+        num_frames = 500
+        duration = 60
+    
+    print("="*70)
+    print("IK SOLVER STRESS TESTS")
+    print("="*70)
+    print(f"Mode: {'Quick' if args.quick else 'Full'}")
+    print(f"Frames per test: {num_frames}")
     
     # Load robot
-    urdf_path = REPO_ROOT / "assets" / "h1_inspire" / "urdf" / "h1_inspire.urdf"
+    print("\nLoading robot model...")
     robot = RobotModel(
-        str(urdf_path),
-        base_link="torso_link",
-        end_effector_link="right_wrist_yaw_link"
+        'assets/h1_inspire/urdf/h1_inspire.urdf',
+        base_link='torso_link',
+        end_effector_link='right_wrist_yaw_link'
     )
-    print(f"\nLoaded: {robot}")
+    print(f"Robot loaded: {robot.num_joints} joints")
     
-    # Test 1: Find best parameters
-    best_params = test_parameter_comparison(robot)
+    # Create solver
+    if args.solver == 'optimized':
+        solver = OptimizedIKSolver(robot, solver_type='levenberg_marquardt')
+    elif args.solver == 'smooth':
+        solver = SmoothIKSolver(robot, enable_filter=False)
+    else:
+        solver = SmoothIKSolver(robot, enable_filter=True)
     
-    # Create optimized solver
-    print("\n--- Using optimized parameters for remaining tests ---")
-    solver = IKSolver(robot, **best_params)
+    print(f"Solver: {args.solver}")
     
-    # Test 2: Grid sampling
-    test_workspace_grid(robot, solver)
+    # Run tests
+    results = []
     
-    # Test 3: Edge cases
-    test_edge_cases(robot, solver)
+    if args.test in ['smooth', 'all']:
+        results.append(test_smooth_tracking(robot, solver, num_frames))
+        results[-1].print_summary()
     
-    # Test 4: Trajectory
-    test_continuous_trajectory(robot, solver)
+    if args.test in ['jerky', 'all']:
+        results.append(test_jerky_movements(robot, solver, num_frames))
+        results[-1].print_summary()
     
-    print_header("All Tests Complete")
-    print("\nReview the results above to understand the solver's performance")
-    print("across different regions of the robot's workspace.\n")
+    if args.test in ['edge', 'all']:
+        results.append(test_workspace_edges(robot, solver, num_frames))
+        results[-1].print_summary()
     
-    return 0
+    if args.test in ['noisy', 'all']:
+        results.append(test_noisy_tracking(robot, solver, num_frames))
+        results[-1].print_summary()
+    
+    if args.test in ['long', 'all'] and not args.quick:
+        results.append(test_long_duration(robot, solver, duration))
+        results[-1].print_summary()
+    
+    if args.test in ['compare', 'all']:
+        compare_solvers(robot, num_frames)
+    
+    if args.test in ['dual', 'all']:
+        test_dual_arm(num_frames)
+    
+    print("\n" + "="*70)
+    print("TESTS COMPLETE")
+    print("="*70)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Enable 64-bit precision
+    jax.config.update("jax_enable_x64", True)
+    main()
