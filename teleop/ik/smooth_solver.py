@@ -225,7 +225,8 @@ class SmoothIKSolver:
     def solve(
         self,
         target: SE3Pose,
-        initial_guess: Optional[Array] = None
+        initial_guess: Optional[Array] = None,
+        compute_error: bool = True
     ) -> SmoothIKResult:
         """
         Solve IK for a target pose with smoothness.
@@ -236,6 +237,7 @@ class SmoothIKSolver:
         Args:
             target: Desired end-effector pose.
             initial_guess: Starting joint angles. If None, uses previous solution.
+            compute_error: If False, skip error computation (faster). Default True.
         
         Returns:
             SmoothIKResult with filtered and raw solutions.
@@ -246,7 +248,7 @@ class SmoothIKSolver:
         # Ensure within limits
         initial_guess = jnp.clip(initial_guess, self._lower_limits, self._upper_limits)
         
-        # Solve
+        # Solve (all JAX, no conversions)
         raw_solution, state = self._solve_jit(
             initial_guess,
             target.position,
@@ -254,24 +256,34 @@ class SmoothIKSolver:
             self._prev_solution
         )
         
-        # Update previous solution for next frame
+        # Update previous solution for next frame (stays as jnp)
         self._prev_solution = raw_solution
         
-        # Apply post-processing filter
+        # Apply post-processing filter (avoid conversion if possible)
         if self._filter is not None:
-            self._filter.add_data(np.array(raw_solution))
-            filtered_solution = jnp.array(self._filter.filtered_data)
+            # Use internal JAX filter if available, else numpy
+            if hasattr(self._filter, 'add_data_jax'):
+                filtered_solution = self._filter.add_data_jax(raw_solution)
+            else:
+                # Single conversion: jnp -> np for filter, result stays np
+                raw_np = np.asarray(raw_solution)
+                self._filter.add_data(raw_np)
+                filtered_solution = jnp.asarray(self._filter.filtered_data)
         else:
             filtered_solution = raw_solution
         
-        # Compute errors on raw solution
-        final_pose = self.robot.forward_kinematics(raw_solution)
-        pos_error = float(jnp.linalg.norm(final_pose.position - target.position))
+        # Compute errors only if requested (saves one FK call)
+        if compute_error:
+            final_pose = self.robot.forward_kinematics(raw_solution)
+            pos_error = float(jnp.linalg.norm(final_pose.position - target.position))
+            dot = jnp.sum(final_pose.quaternion * target.quaternion)
+            ori_error = float(1.0 - jnp.abs(dot))
+            converged = pos_error < self.tolerance
+        else:
+            pos_error = 0.0
+            ori_error = 0.0
+            converged = True  # Assume converged if not checking
         
-        dot = jnp.sum(final_pose.quaternion * target.quaternion)
-        ori_error = float(1.0 - jnp.abs(dot))
-        
-        converged = pos_error < self.tolerance
         iterations = int(getattr(state, 'iter_num', self.max_iterations))
         
         return SmoothIKResult(

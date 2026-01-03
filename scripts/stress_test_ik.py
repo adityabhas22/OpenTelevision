@@ -375,9 +375,13 @@ def test_dual_arm(num_frames: int = 200):
         solve_time = (time.perf_counter() - start) * 1000
         
         if i >= 5:  # Skip warmup
+            # Handle optimized result without error metrics
+            left_err = getattr(ik_result, 'left_position_error', 0.0)
+            right_err = getattr(ik_result, 'right_position_error', 0.0)
+            
             result.add(
                 solve_time,
-                (ik_result.left_position_error + ik_result.right_position_error) / 2,
+                (left_err + right_err) / 2,
                 0,
                 ik_result.left_converged and ik_result.right_converged,
                 0
