@@ -305,6 +305,123 @@ def test_long_duration(robot: RobotModel, solver, duration_seconds: float = 60) 
     return run_solver_test(solver, targets, f"Long Duration ({duration_seconds}s)")
 
 
+def test_unreachable_targets(robot: RobotModel, solver, num_tests: int = 50):
+    """
+    Test solver behavior when targets are OUTSIDE the reachable workspace.
+    
+    This is critical for understanding how the solver fails gracefully.
+    In real VR teleoperation, users WILL reach past the robot's workspace.
+    
+    Tests three types of unreachable targets:
+    1. Too far away (position scaled 2x beyond workspace)
+    2. Partially reachable (position OK but orientation impossible)
+    3. Completely random poses (likely unreachable)
+    """
+    print("\n" + "="*70)
+    print("UNREACHABLE TARGET BEHAVIOR TEST")
+    print("="*70)
+    print("\nThis test intentionally provides unreachable targets to see how")
+    print("the solver behaves when it CANNOT reach the goal.\n")
+    
+    lower, upper = robot.joint_limits
+    center = (lower + upper) / 2
+    
+    # Get a reference reachable pose
+    ref_pose = robot.forward_kinematics(center)
+    workspace_radius = float(jnp.linalg.norm(ref_pose.position))
+    
+    print(f"Workspace reference radius: {workspace_radius:.3f} m")
+    print(f"Running {num_tests} unreachable target tests...\n")
+    
+    results = {
+        "too_far": {"pos_errors": [], "converged": [], "solve_times": []},
+        "bad_orientation": {"pos_errors": [], "converged": [], "solve_times": []},
+        "random": {"pos_errors": [], "converged": [], "solve_times": []},
+    }
+    
+    rng = jax.random.PRNGKey(99)
+    
+    # Reset solver
+    if hasattr(solver, 'reset'):
+        solver.reset()
+    
+    for i in range(num_tests):
+        rng, k1, k2, k3 = jax.random.split(rng, 4)
+        
+        # --- Test 1: Position too far away ---
+        # Take a reachable pose and push it 2x further
+        rand_angles = jax.random.uniform(k1, shape=(robot.num_joints,), minval=lower, maxval=upper)
+        reachable_pose = robot.forward_kinematics(rand_angles)
+        
+        # Scale position to be unreachable (2x further from origin)
+        unreachable_pos = reachable_pose.position * 2.0
+        too_far_target = SE3Pose(unreachable_pos, reachable_pose.quaternion)
+        
+        start = time.perf_counter()
+        result = solver.solve(too_far_target)
+        solve_time = (time.perf_counter() - start) * 1000
+        
+        results["too_far"]["pos_errors"].append(result.position_error)
+        results["too_far"]["converged"].append(result.converged)
+        results["too_far"]["solve_times"].append(solve_time)
+        
+        # --- Test 2: Valid position but impossible orientation ---
+        # Use a reachable position but random quaternion
+        rand_quat = jax.random.normal(k2, shape=(4,))
+        rand_quat = rand_quat / jnp.linalg.norm(rand_quat)  # Normalize to unit quaternion
+        bad_ori_target = SE3Pose(reachable_pose.position, rand_quat)
+        
+        start = time.perf_counter()
+        result = solver.solve(bad_ori_target)
+        solve_time = (time.perf_counter() - start) * 1000
+        
+        results["bad_orientation"]["pos_errors"].append(result.position_error)
+        results["bad_orientation"]["converged"].append(result.converged)
+        results["bad_orientation"]["solve_times"].append(solve_time)
+        
+        # --- Test 3: Completely random pose (likely unreachable) ---
+        random_pos = jax.random.uniform(k3, shape=(3,), minval=-2.0, maxval=2.0)
+        random_quat = jax.random.normal(k3, shape=(4,))
+        random_quat = random_quat / jnp.linalg.norm(random_quat)
+        random_target = SE3Pose(random_pos, random_quat)
+        
+        start = time.perf_counter()
+        result = solver.solve(random_target)
+        solve_time = (time.perf_counter() - start) * 1000
+        
+        results["random"]["pos_errors"].append(result.position_error)
+        results["random"]["converged"].append(result.converged)
+        results["random"]["solve_times"].append(solve_time)
+    
+    # Print results
+    print("=" * 70)
+    print(f"{'Scenario':<25} {'Conv Rate':<12} {'Mean Err (cm)':<15} {'Max Err (cm)':<15} {'Mean Time (ms)':<15}")
+    print("-" * 70)
+    
+    for scenario, data in results.items():
+        pos_errs = np.array(data["pos_errors"]) * 100  # to cm
+        conv_rate = np.mean(data["converged"]) * 100
+        mean_time = np.mean(data["solve_times"])
+        
+        scenario_name = {
+            "too_far": "Position 2x too far",
+            "bad_orientation": "Bad orientation",
+            "random": "Completely random"
+        }[scenario]
+        
+        print(f"{scenario_name:<25} {conv_rate:>6.1f}%      {np.mean(pos_errs):>8.2f}       "
+              f"{np.max(pos_errs):>8.2f}       {mean_time:>8.2f}")
+    
+    print("-" * 70)
+    print("\n📊 INTERPRETATION:")
+    print("  - 'Position 2x too far': Solver should fail (low convergence expected)")
+    print("  - 'Bad orientation': May partially converge (position OK, orientation not)")
+    print("  - 'Completely random': Wild card, mostly failures expected")
+    print("\n💡 KEY INSIGHT: The solver returns its 'best effort' even on failure.")
+    print("   The `converged` flag tells you if you should trust the result.")
+    print("   In teleoperation, you should HOLD THE LAST GOOD POSE when converged=False.\n")
+
+
 def compare_solvers(robot: RobotModel, num_frames: int = 200):
     """Compare all available solvers."""
     print("\n" + "="*70)
@@ -392,7 +509,7 @@ def test_dual_arm(num_frames: int = 200):
 
 def main():
     parser = argparse.ArgumentParser(description="Stress test IK solvers")
-    parser.add_argument('--test', choices=['smooth', 'jerky', 'edge', 'noisy', 'long', 'compare', 'dual', 'all'],
+    parser.add_argument('--test', choices=['smooth', 'jerky', 'edge', 'noisy', 'long', 'unreachable', 'compare', 'dual', 'all'],
                         default='all', help='Which test to run')
     parser.add_argument('--quick', action='store_true', help='Quick mode (fewer iterations)')
     parser.add_argument('--solver', choices=['optimized', 'smooth', 'smooth_filtered'],
@@ -457,6 +574,9 @@ def main():
     
     if args.test in ['compare', 'all']:
         compare_solvers(robot, num_frames)
+    
+    if args.test in ['unreachable', 'all']:
+        test_unreachable_targets(robot, solver, num_tests=30)
     
     if args.test in ['dual', 'all']:
         test_dual_arm(num_frames)
