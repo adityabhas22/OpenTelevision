@@ -34,7 +34,7 @@ from teleop.ik.utils import SE3Pose
 
 class IKResult(NamedTuple):
     """Result from the optimized IK solver."""
-    joint_angles: Array  # (n_joints,) solution
+    joint_angles: Array  # (n_joints,) solution 
     position_error: float  # L2 distance to target (meters)
     orientation_error: float  # Quaternion geodesic distance
     iterations: int  # Number of solver iterations

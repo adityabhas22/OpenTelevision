@@ -78,8 +78,11 @@ class RobotModel:
         self._upper_limits = []
         for joint in self._actuated_joints:
             if joint.limit is not None:
-                self._lower_limits.append(joint.limit.lower or -jnp.pi)
-                self._upper_limits.append(joint.limit.upper or jnp.pi)
+                # Use explicit None check: `or` fails when limit is 0.0 (falsy)
+                lower = joint.limit.lower if joint.limit.lower is not None else -jnp.pi
+                upper = joint.limit.upper if joint.limit.upper is not None else jnp.pi
+                self._lower_limits.append(lower)
+                self._upper_limits.append(upper)
             else:
                 # Continuous joints have no limits
                 self._lower_limits.append(-jnp.pi)
@@ -97,6 +100,7 @@ class RobotModel:
         """Return (lower_limits, upper_limits) as JAX arrays."""
         return (self._lower_limits, self._upper_limits)
     
+    #Can this be further optimized? 
     def _find_root_link(self) -> str:
         """Find the root link of the URDF (link with no parent)."""
         child_links = {j.child for j in self._urdf.joints}
